@@ -1,11 +1,13 @@
-import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { HumanMessage } from "@langchain/core/messages";
-import { rootCauseTool } from "./tools/rootCauseTool";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import {
+  AnalysisResultSchema,
+  type AnalysisResult,
+  type DebugRequest,
+} from "./schemas";
 import { confidenceTool } from "./tools/confidenceTool";
+import { rootCauseTool } from "./tools/rootCauseTool";
 import { suggestionTool } from "./tools/suggestionTool";
-import { parseAnalysisResult } from "./parser";
-import type { DebugRequest, AnalysisResult } from "./schemas";
 
 export class AgentError extends Error {
   constructor(message: string) {
@@ -14,115 +16,87 @@ export class AgentError extends Error {
   }
 }
 
-const SYSTEM_PROMPT = `You are an AI debug agent. Your job is to analyze a code snippet and error message by calling three tools in a strict order, then emit a final JSON result.
+const SYSTEM_PROMPT = `You are an expert code debugger. Analyze the provided code snippet and error message. 
 
-## Tool Execution Order (MANDATORY)
+You MUST use the following tools:
+1. 'root_cause_tool': Submit diagnosis.
+2. 'confidence_tool': Submit confidence score.
+3. 'code_improvement_suggestion': Submit actionable improvements. CALL THIS 3-5 TIMES.
 
-You MUST call the tools in this exact order:
-
-1. **rootCauseTool** — Call this FIRST with the code snippet, error message, and language. It returns a 2–4 sentence root cause diagnosis string.
-
-2. **confidenceTool** — Call this SECOND with the root cause string returned by rootCauseTool. It returns a JSON object with score, label, and reason.
-
-3. **suggestionTool** — Call this THIRD with the original code snippet and the root cause string from rootCauseTool. It returns an array of 3–5 improvement suggestions.
-
-## Rules
-
-- Call each tool EXACTLY ONCE. Do not call any tool more than once.
-- Do not skip any tool.
-- Do not call confidenceTool or suggestionTool before rootCauseTool has returned.
-- Pass the root cause string from rootCauseTool directly to both confidenceTool and suggestionTool.
-- Pass the ORIGINAL code (from the user's request) to suggestionTool, not any modified version.
-
-## Final Output
-
-After all three tools have returned results, emit a final JSON block (wrapped in \`\`\`json ... \`\`\`) that conforms to this schema:
-
-\`\`\`json
-{
-  "rootCause": "<the root cause string from rootCauseTool>",
-  "confidence": <integer score 0–100 from confidenceTool>,
-  "confidenceLabel": "<High|Medium|Low from confidenceTool>",
-  "confidenceReason": "<reason string from confidenceTool>",
-  "suggestions": [
-    {
-      "title": "<suggestion title>",
-      "explanation": "<explanation>",
-      "before": "<original code snippet>",
-      "after": "<improved code snippet>"
-    }
-  ]
-}
-\`\`\`
-
-The JSON block must be the LAST thing you output. Do not add any text after the closing code fence.`;
+Only use tools. Do not provide text responses.`;
 
 export async function createDebugAgent(
-  request: DebugRequest
+  request: DebugRequest,
 ): Promise<AnalysisResult> {
-  const llm = new ChatGoogleGenerativeAI({ model: "gemini-2.5-flash-lite" });
   const tools = [rootCauseTool, confidenceTool, suggestionTool];
-
-  const agent = createReactAgent({
-    llm,
-    tools,
-    stateModifier: SYSTEM_PROMPT,
+  const llm = new ChatGoogleGenerativeAI({
+    model: "gemini-2.0-flash",
+    temperature: 0,
   });
 
-  const userMessage = `Please analyze the following code error.
+  // 1. Create the executor. This replaces the while loop and turn logic.
+  const agent = createReactAgent({
+    llm,
+    tools:[],
+    messageModifier: SYSTEM_PROMPT,
+  });
 
-Language: ${request.language}
-
-Code:
-\`\`\`${request.language}
-${request.code}
-\`\`\`
-
-Error:
-${request.error}
-
-Call rootCauseTool first, then confidenceTool with the root cause, then suggestionTool with the original code and root cause. Finally, emit the AnalysisResult JSON block.`;
-
-  // Timeout: abort if the agent takes longer than 60 seconds
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
+  const userMessage = `Language: ${request.language}\nCode:\n\`\`\`${request.language}\n${request.code}\n\`\`\`\nError:\n${request.error}`;
 
   try {
+    // 2. Invoke the agent. It will automatically call tools until it decides it's done.
     const result = await agent.invoke(
-      { messages: [new HumanMessage(userMessage)] },
       {
-        // Cap the ReAct loop at 10 iterations (3 tools + a few LLM turns + buffer)
-        // prevents infinite tool-calling loops
-        recursionLimit: 10,
-        signal: controller.signal,
-      }
+        messages: [{ role: "user", content: userMessage }],
+      },
+      {
+        recursionLimit: 5,
+      },
     );
-    clearTimeout(timeout);
 
-    // Extract the final message content from the agent's response
-    const messages = result.messages as Array<{ content: unknown }>;
-    const finalMessage = messages[messages.length - 1];
-    const content = finalMessage.content;
+    // 3. Extract tool outputs from the message history
+    const toolMessages = result.messages.filter(
+      (m: any) => m._getType() === "tool",
+    );
 
-    let outputText: string;
-    if (typeof content === "string") {
-      outputText = content;
-    } else if (Array.isArray(content)) {
-      // Handle array content (text blocks)
-      outputText = (content as Array<{ type: string; text?: string }>)
-        .filter((part) => part.type === "text" && typeof part.text === "string")
-        .map((part) => part.text as string)
-        .join("");
-    } else {
-      outputText = String(content);
+    let rootCauseData, confidenceData;
+    const suggestions: any[] = [];
+
+    for (const msg of toolMessages) {
+      const content =
+        typeof msg.content === "string" ? JSON.parse(msg.content) : msg.content;
+
+      // Map back to your data structures based on the tool name in the message
+      // Note: check your tool definitions for the exact name property
+      if (msg.name === "root_cause_tool") rootCauseData = content;
+      if (msg.name === "confidence_tool") confidenceData = content;
+      if (msg.name === "code_improvement_suggestion") suggestions.push(content);
     }
 
-    return parseAnalysisResult(outputText);
+    // Validation
+    if (!rootCauseData || !confidenceData || suggestions.length < 3) {
+      throw new AgentError(
+        "Agent failed to provide complete tool-based analysis.",
+      );
+    }
+
+    const finalResult = {
+      rootCause: `${rootCauseData.pattern}. ${rootCauseData.explanation} Mechanism: ${rootCauseData.errorMechanism}`,
+      confidence: confidenceData.score,
+      confidenceLabel: confidenceData.label,
+      confidenceReason: confidenceData.reason,
+      suggestions: suggestions.slice(0, 5).map((s) => ({
+        title: s.title,
+        explanation: s.explanation,
+        before: s.before,
+        after: s.after,
+      })),
+    };
+
+    return AnalysisResultSchema.parse(finalResult);
   } catch (err) {
-    clearTimeout(timeout);
-    if (err instanceof AgentError) {
-      throw err;
-    }
-    throw new AgentError("Analysis failed. Please try again.");
+    if (err instanceof AgentError) throw err;
+    console.error("Agent execution error:", err);
+    throw new AgentError("Analysis failed.");
   }
 }

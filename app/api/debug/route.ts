@@ -33,6 +33,7 @@ export async function POST(request: Request) {
     console.log(analysis)
     return NextResponse.json(analysis, { status: 200 });
   } catch (err) {
+    console.log(err)
     if (err instanceof AgentError) {
       return NextResponse.json({ error: err.message }, { status: 500 });
     }
