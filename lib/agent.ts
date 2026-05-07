@@ -10,9 +10,11 @@ import { rootCauseTool } from "./tools/rootCauseTool";
 import { suggestionTool } from "./tools/suggestionTool";
 
 export class AgentError extends Error {
-  constructor(message: string) {
+  status: number;
+  constructor(message: string, status: number = 500) {
     super(message);
     this.name = "AgentError";
+    this.status = status;
   }
 }
 
@@ -94,9 +96,19 @@ export async function createDebugAgent(
     };
 
     return AnalysisResultSchema.parse(finalResult);
-  } catch (err) {
+  } catch (err: any) {
     if (err instanceof AgentError) throw err;
+    
+    // Handle 429 Too Many Requests / Quota Exceeded
+    if (err.status === 429 || err.message?.includes("429") || err.message?.toLowerCase().includes("quota exceeded")) {
+      console.error("Rate limit or quota exceeded:", err);
+      throw new AgentError(
+        "AI model rate limit or quota exceeded. Please wait a moment or check your API key status.",
+        429
+      );
+    }
+    
     console.error("Agent execution error:", err);
-    throw new AgentError("Analysis failed.");
+    throw new AgentError("Analysis failed. Please try again later.");
   }
 }

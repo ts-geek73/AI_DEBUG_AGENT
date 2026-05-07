@@ -35,7 +35,7 @@ export async function POST(request: Request) {
   } catch (err) {
     console.log(err)
     if (err instanceof AgentError) {
-      return NextResponse.json({ error: err.message }, { status: 500 });
+      return NextResponse.json({ error: err.message }, { status: err.status });
     }
     return NextResponse.json(
       { error: "Analysis failed. Please try again." },
