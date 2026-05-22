@@ -39,7 +39,7 @@ export async function createDebugAgent(
   // 1. Create the executor. This replaces the while loop and turn logic.
   const agent = createReactAgent({
     llm,
-    tools:[],
+    tools,
     messageModifier: SYSTEM_PROMPT,
   });
 
